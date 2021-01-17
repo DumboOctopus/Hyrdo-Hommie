@@ -58,8 +58,16 @@
 
 /* Standard Includes */
 #include <stdint.h>
-#include <stddef.h>
 #include <stdbool.h>
+
+volatile uint16_t millis_ultrasonic = 0;
+volatile uint32_t grams_drank = 0;
+
+/* Ultrasonic: Our ultrasonic only has 1 pin which is used both as trig and echo*/
+#define ULTRASONIC_SIG_PORT GPIO_PORT_P4
+#define ULTRASONIC_SIG_PIN GPIO_PIN0
+
+static volatile int shared;
 
 //![Simple SysTick Example]
 int main(void)
@@ -73,9 +81,9 @@ int main(void)
     /* Configuring SysTick to trigger at 1500000 (MCLK is 1.5MHz so this will 
      * make it toggle every 1s) */
     MAP_SysTick_enableModule();
-    MAP_SysTick_setPeriod(1500000);
-    MAP_Interrupt_enableSleepOnIsrExit();
-    MAP_SysTick_enableInterrupt();
+    MAP_SysTick_setPeriod(1500000); // 1.5M/1000 will make it toggle every microsecond
+    //MAP_Interrupt_enableSleepOnIsrExit();
+    //MAP_SysTick_enableInterrupt();
     
     /* on board button **/
     MAP_GPIO_setAsInputPinWithPullUpResistor(GPIO_PORT_P1, GPIO_PIN1);
@@ -89,27 +97,66 @@ int main(void)
     MAP_GPIO_enableInterrupt(GPIO_PORT_P4, GPIO_PIN1);
     MAP_Interrupt_enableInterrupt(INT_PORT4);
 
+    /* ultrasonic */
+    MAP_GPIO_clearInterruptFlag(ULTRASONIC_SIG_PORT, ULTRASONIC_SIG_PIN);
+    MAP_GPIO_enableInterrupt(ULTRASONIC_SIG_PORT, ULTRASONIC_SIG_PIN);
+    MAP_Interrupt_enableInterrupt(ULTRASONIC_SIG_PORT);
+
+
     /* Enabling MASTER interrupts */
     MAP_Interrupt_enableMaster();  
 
-    /** Setting up UART terminal */
-//    Display_Handle    displayHandle;
-//    Display_Params    displayParams;
-//
-//    Display_Params_init(&displayParams);
-//    displayHandle = Display_open(Display_Type_UART, NULL);
 
     volatile uint8_t x;
     while (1)
     {
-        //MAP_PCM_gotoLPM0();
-        x = MAP_GPIO_getInputPinValue(GPIO_PORT_P4, GPIO_PIN1);
-//        Display_printf(displayHandle, 1, 0, "ADC Reading %d", x);
+        //do something
+        //printf("Starting ultrasonic reading..\n");
+
+        // setup
+        MAP_GPIO_setAsOutputPin(ULTRASONIC_SIG_PORT, ULTRASONIC_SIG_PIN);
+        MAP_GPIO_disableInterrupt(ULTRASONIC_SIG_PORT, ULTRASONIC_SIG_PIN);
+        MAP_GPIO_setOutputLowOnPin(ULTRASONIC_SIG_PORT, ULTRASONIC_SIG_PIN);
+        Delay(2);
+
+        // pulse
+        int startPulse = MAP_SysTick_getValue();
+        MAP_GPIO_setOutputHighOnPin(ULTRASONIC_SIG_PORT, ULTRASONIC_SIG_PIN);
+        Delay(5);
+        MAP_GPIO_setOutputLowOnPin(ULTRASONIC_SIG_PORT, ULTRASONIC_SIG_PIN);
+
+        //now using ultrasonic to read
+        MAP_GPIO_setAsInputPin(ULTRASONIC_SIG_PORT, ULTRASONIC_SIG_PIN);
+        MAP_GPIO_clearInterruptFlag(ULTRASONIC_SIG_PORT, ULTRASONIC_SIG_PIN);
+        MAP_GPIO_enableInterrupt(ULTRASONIC_SIG_PORT, ULTRASONIC_SIG_PIN);
+
+        // function returns when sensor detects pulse
+        Delay(10000);
+        int diff = (shared - startPulse);
+        if(diff < 0) diff = -diff;
+        float mircos = diff / (float) (1500000/1000/1000); // how many micros
+        float cm = diff / 29 / 2;
+
+        if(cm < 100)
+            MAP_GPIO_setOutputHighOnPin(GPIO_PORT_P1, GPIO_PIN0);
+        else
+            MAP_GPIO_setOutputLowOnPin(GPIO_PORT_P1, GPIO_PIN0);
+
+        //printf("Diff %d\n", shared - startPulse);
+        Delay(100);
+
+
+
     }
 }
 
 void SysTick_Handler(void)
 {
+
+//    total_millis ++;
+//    if(total_millis > 24*60*60*1000) { // one day has passed;
+//        total_millis = 0;
+//    }
     //MAP_GPIO_toggleOutputOnPin(GPIO_PORT_P1, GPIO_PIN0);
 }
 //![Simple SysTick Example]
@@ -145,5 +192,31 @@ void PORT4_IRQHandler(void)
         MAP_GPIO_toggleOutputOnPin(GPIO_PORT_P1, GPIO_PIN0);
     }
 
+    if(status & ULTRASONIC_SIG_PIN)
+    {
+        //printf("Recieved signal\n ");
+        shared = MAP_SysTick_getValue();
+    }
+
 }
 
+
+void Delay(uint32_t micros) {
+    volatile uint32_t i;
+
+        for (i = 0 ; i < micros ; i++);
+
+}
+
+uint32_t in_sensor(){
+
+    MAP_GPIO_setAsInputPin(ULTRASONIC_SIG_PORT, ULTRASONIC_SIG_PIN);
+    uint8_t x = MAP_GPIO_getInputPinValue(ULTRASONIC_SIG_PORT, ULTRASONIC_SIG_PIN);
+
+    printf("initial: %d\n", x);
+    while( x == MAP_GPIO_getInputPinValue(ULTRASONIC_SIG_PORT, ULTRASONIC_SIG_PIN)) {
+
+    }
+    printf("final: %d\n", MAP_GPIO_getInputPinValue(ULTRASONIC_SIG_PORT, ULTRASONIC_SIG_PIN));
+    return x;
+}
