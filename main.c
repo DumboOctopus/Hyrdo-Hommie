@@ -54,20 +54,35 @@
   *******************************************************************************/
 /* DriverLib Includes */
 #include <ti/devices/msp432p4xx/driverlib/driverlib.h>
-#include <ti/display/Display.h>
 
 /* Standard Includes */
 #include <stdint.h>
 #include <stdbool.h>
 
-volatile uint16_t millis_ultrasonic = 0;
-volatile uint32_t grams_drank = 0;
 
 /* Ultrasonic: Our ultrasonic only has 1 pin which is used both as trig and echo*/
 #define ULTRASONIC_SIG_PORT GPIO_PORT_P4
 #define ULTRASONIC_SIG_PIN GPIO_PIN0
 
-static volatile int shared;
+/* state machine states */
+#define STATE_NO_CUP 0     // no cup has been placed on water stand
+#define STATE_CUP_PLACED 1 // cup is placed. records start time
+#define STATE_FILLING 2    // water is being filled into cup. Increaments filling_time if dh/dt > 0
+#define STATE_CUP_LIFT 3   // button unpressed. Processes heights array to find end time. Updates amt drank
+
+/* Constants */
+#define Q 10 // volume metric flow rate of dispenser. Measured in grams/second
+
+
+// sensors vars
+static volatile int ultrasonic_echo_time;
+
+
+
+inline bool readButton()
+{
+    return MAP_GPIO_getInputPinValue(GPIO_PORT_P4, GPIO_PIN1) == 0;
+}
 
 //![Simple SysTick Example]
 int main(void)
@@ -81,7 +96,7 @@ int main(void)
     /* Configuring SysTick to trigger at 1500000 (MCLK is 1.5MHz so this will 
      * make it toggle every 1s) */
     MAP_SysTick_enableModule();
-    MAP_SysTick_setPeriod(1500000); // 1.5M/1000 will make it toggle every microsecond
+    MAP_SysTick_setPeriod(1500000); // 1.5M will make it toggle every second
     //MAP_Interrupt_enableSleepOnIsrExit();
     //MAP_SysTick_enableInterrupt();
     
@@ -93,72 +108,104 @@ int main(void)
 
     /* external button */
     MAP_GPIO_setAsInputPinWithPullUpResistor(GPIO_PORT_P4, GPIO_PIN1);
-    MAP_GPIO_clearInterruptFlag(GPIO_PORT_P4, GPIO_PIN1);
-    MAP_GPIO_enableInterrupt(GPIO_PORT_P4, GPIO_PIN1);
-    MAP_Interrupt_enableInterrupt(INT_PORT4);
+//    MAP_GPIO_clearInterruptFlag(GPIO_PORT_P4, GPIO_PIN1);
+//    MAP_GPIO_enableInterrupt(GPIO_PORT_P4, GPIO_PIN1);
+//    MAP_Interrupt_enableInterrupt(INT_PORT4);
 
     /* ultrasonic */
     MAP_GPIO_clearInterruptFlag(ULTRASONIC_SIG_PORT, ULTRASONIC_SIG_PIN);
     MAP_GPIO_enableInterrupt(ULTRASONIC_SIG_PORT, ULTRASONIC_SIG_PIN);
-    MAP_Interrupt_enableInterrupt(ULTRASONIC_SIG_PORT);
+    MAP_Interrupt_enableInterrupt(INT_PORT4);
 
 
     /* Enabling MASTER interrupts */
     MAP_Interrupt_enableMaster();  
 
+    uint16_t state = STATE_NO_CUP;
+    double grams_drank = 0;
+    double filling_time = 0;
+    int lastFillCalc = 0;
+    float last_ultrasonic_reading = 0;
 
-    volatile uint8_t x;
     while (1)
     {
         //do something
-        //printf("Starting ultrasonic reading..\n");
+        bool btn = readButton();
+        float cm = read_ultrasonic();
 
-        // setup
-        MAP_GPIO_setAsOutputPin(ULTRASONIC_SIG_PORT, ULTRASONIC_SIG_PIN);
-        MAP_GPIO_disableInterrupt(ULTRASONIC_SIG_PORT, ULTRASONIC_SIG_PIN);
-        MAP_GPIO_setOutputLowOnPin(ULTRASONIC_SIG_PORT, ULTRASONIC_SIG_PIN);
-        Delay(2);
+        // only read ultrasonic if you are in a state that will read the
+//        if(state == STATE_CUP_PLACED || state == STATE_FILLING || state == STATE_CUP_PLACED)
+//            cm = read_ultrasonic();
 
-        // pulse
-        int startPulse = MAP_SysTick_getValue();
-        MAP_GPIO_setOutputHighOnPin(ULTRASONIC_SIG_PORT, ULTRASONIC_SIG_PIN);
-        Delay(5);
-        MAP_GPIO_setOutputLowOnPin(ULTRASONIC_SIG_PORT, ULTRASONIC_SIG_PIN);
+        switch(state){
+        case STATE_NO_CUP:
+            if(btn)
+                state = STATE_CUP_PLACED;
 
-        //now using ultrasonic to read
-        MAP_GPIO_setAsInputPin(ULTRASONIC_SIG_PORT, ULTRASONIC_SIG_PIN);
-        MAP_GPIO_clearInterruptFlag(ULTRASONIC_SIG_PORT, ULTRASONIC_SIG_PIN);
-        MAP_GPIO_enableInterrupt(ULTRASONIC_SIG_PORT, ULTRASONIC_SIG_PIN);
-
-        // function returns when sensor detects pulse
-        Delay(10000);
-        int diff = (shared - startPulse);
-        if(diff < 0) diff = -diff;
-        float mircos = diff / (float) (1500000/1000/1000); // how many micros
-        float cm = diff / 29 / 2;
-
-        if(cm < 45)
             MAP_GPIO_setOutputHighOnPin(GPIO_PORT_P1, GPIO_PIN0);
-        else
+            break;
+        case STATE_CUP_PLACED:
+            filling_time = 0;
+            if(cm - last_ultrasonic_reading < -0.5) {
+                // non negliable decrease in height..
+                // we have begun filling
+                state = STATE_FILLING;
+                lastFillCalc = (int) MAP_SysTick_getValue();
+            }
+            if(! btn)
+                state = STATE_NO_CUP;
+            break;
+        case STATE_FILLING:
             MAP_GPIO_setOutputLowOnPin(GPIO_PORT_P1, GPIO_PIN0);
+            float diffTime =0;
+            int currTime = (int) MAP_SysTick_getValue();
+            if(cm - last_ultrasonic_reading < -.5 ) {
+                // we are still filling..
+                int diffRaw =-(currTime - lastFillCalc);
+                if(diffRaw < 0) diffRaw += 1500000;
+                diffTime = diffRaw/1500000.0;
 
-        printf("Diff %d\n", cm);
-        Delay(100);
+                filling_time += diffTime;
+                lastFillCalc = currTime;
+            }
+            if(!btn){
+                state = STATE_CUP_LIFT;
+            }
+            printf("Filling time %d (diff time %d)\n", (int) (1000*filling_time), (int) (1000*diffTime));
+            break;
+        case STATE_CUP_LIFT:
+            grams_drank += Q* (filling_time);
+            state = STATE_NO_CUP;
+
+            // update display goes here
+            printf("Grams drank: %d\n", (int)(grams_drank));
+            break;
+
+        }
+
+        last_ultrasonic_reading = cm;
+
+//        if(cm < 45)
+//
+//        else
+//            MAP_GPIO_setOutputLowOnPin(GPIO_PORT_P1, GPIO_PIN0);
+
+       // Delay(100);
 
 
 
     }
 }
 
-void SysTick_Handler(void)
-{
+//void SysTick_Handler(void)
+//{
 
 //    total_millis ++;
 //    if(total_millis > 24*60*60*1000) { // one day has passed;
 //        total_millis = 0;
 //    }
     //MAP_GPIO_toggleOutputOnPin(GPIO_PORT_P1, GPIO_PIN0);
-}
+//}
 //![Simple SysTick Example]
 
 /* GPIO ISR */
@@ -195,7 +242,7 @@ void PORT4_IRQHandler(void)
     if(status & ULTRASONIC_SIG_PIN)
     {
         //printf("Recieved signal\n ");
-        shared = MAP_SysTick_getValue();
+        ultrasonic_echo_time = MAP_SysTick_getValue();
     }
 
 }
@@ -208,15 +255,31 @@ void Delay(uint32_t micros) {
 
 }
 
-uint32_t in_sensor(){
+float read_ultrasonic(){
+    // setup
+            MAP_GPIO_setAsOutputPin(ULTRASONIC_SIG_PORT, ULTRASONIC_SIG_PIN);
+            MAP_GPIO_disableInterrupt(ULTRASONIC_SIG_PORT, ULTRASONIC_SIG_PIN);
+            MAP_GPIO_setOutputLowOnPin(ULTRASONIC_SIG_PORT, ULTRASONIC_SIG_PIN);
+            Delay(2);
 
-    MAP_GPIO_setAsInputPin(ULTRASONIC_SIG_PORT, ULTRASONIC_SIG_PIN);
-    uint8_t x = MAP_GPIO_getInputPinValue(ULTRASONIC_SIG_PORT, ULTRASONIC_SIG_PIN);
+            // pulse
+            int startPulse = MAP_SysTick_getValue();
+            MAP_GPIO_setOutputHighOnPin(ULTRASONIC_SIG_PORT, ULTRASONIC_SIG_PIN);
+            Delay(5);
+            MAP_GPIO_setOutputLowOnPin(ULTRASONIC_SIG_PORT, ULTRASONIC_SIG_PIN);
 
-    printf("initial: %d\n", x);
-    while( x == MAP_GPIO_getInputPinValue(ULTRASONIC_SIG_PORT, ULTRASONIC_SIG_PIN)) {
+            //now using ultrasonic to read
+            MAP_GPIO_setAsInputPin(ULTRASONIC_SIG_PORT, ULTRASONIC_SIG_PIN);
+            MAP_GPIO_clearInterruptFlag(ULTRASONIC_SIG_PORT, ULTRASONIC_SIG_PIN);
+            MAP_GPIO_enableInterrupt(ULTRASONIC_SIG_PORT, ULTRASONIC_SIG_PIN);
 
-    }
-    printf("final: %d\n", MAP_GPIO_getInputPinValue(ULTRASONIC_SIG_PORT, ULTRASONIC_SIG_PIN));
-    return x;
+            // function returns when sensor detects pulse
+            Delay(10000);
+            int diff = (ultrasonic_echo_time - startPulse);
+            if(diff < 0) diff = -diff;
+            float mircos = diff / (float) (1500000/1000/1000); // how many micros
+            float cm = diff / 29 / 2;
+       // if(cm < 0) return read_ultrasonic();
+        return cm;
+
 }
